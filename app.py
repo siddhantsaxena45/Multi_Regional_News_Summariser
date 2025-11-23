@@ -7,73 +7,137 @@ from nltk.tokenize import word_tokenize
 from deep_translator import GoogleTranslator
 import nltk
 from langdetect import detect, DetectorFactory
-from fpdf import FPDF
 from gtts import gTTS
 import io
+from newspaper import Article
 
-# For consistent language detection
+# NLTK setup
 DetectorFactory.seed = 0
-
-# Download tokenizer
 nltk.download('punkt')
 nltk.download('punkt_tab')
 
-# Streamlit page config
-st.set_page_config(
-    page_title="News Summarizer",
-    page_icon="📰",
-    layout="centered",
-)
+# -----------------------------------------------------------
+# ADVANCED SCRAPER (Custom → Newspaper3k → Generic)
+# -----------------------------------------------------------
+def get_article(url):
+    art = scrape_custom(url)
+    if art and len(art["text"]) > 200:
+        return art
 
-# ---------------- SCRAPE ARTICLE ---------------- #
-def get_article_body(url):
+    art = scrape_newspaper3k(url)
+    if art and len(art["text"]) > 200:
+        return art
+
+    return scrape_generic(url)
+
+
+# ---------------- CUSTOM SCRAPER ---------------- #
+def scrape_custom(url):
     try:
-        page = requests.get(url, timeout=10)
+        page = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
         soup = BeautifulSoup(page.text, "html.parser")
 
-        # Remove useless content
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
+        for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
             tag.decompose()
 
-        # Try common article containers
-        containers = [
-            "article",
-            "main",
-            "div[class*='content']",
-            "div[class*='story']",
-            "div[class*='article']",
-            "section"
-        ]
+        title = soup.find("h1").get_text(strip=True) if soup.find("h1") else "News Article"
 
-        for selector in containers:
-            section = soup.select_one(selector)
-            if section:
-                text = " ".join(
-                    [p.get_text(" ", strip=True) for p in section.find_all("p")]
-                )
-                if len(text) > 200:
-                    return text
+        # TOI typical structure
+        toi_blocks = soup.find_all("div", class_="Normal")
+        if not toi_blocks:
+            toi_blocks = soup.find_all("div", class_="ga-headlines")
 
-        # Fallback: all paragraphs
-        paragraphs = soup.find_all("p")
-        text = " ".join([p.get_text(' ', strip=True) for p in paragraphs])
-        return text
+        if toi_blocks:
+            text = " ".join(block.get_text(" ", strip=True) for block in toi_blocks)
+            return {"title": title, "text": clean_news_text(text)}
+
+        # <article> tag fallback
+        article_tag = soup.find("article")
+        if article_tag:
+            p = [x.get_text(" ", strip=True) for x in article_tag.find_all("p")]
+            text = " ".join(p)
+            return {"title": title, "text": clean_news_text(text)}
+
+        return None
 
     except:
-        return ""
+        return None
 
 
-# ---------------- CLEAN TEXT ---------------- #
+# ---------------- NEWSPAPER3K ---------------- #
+def scrape_newspaper3k(url):
+    try:
+        a = Article(url)
+        a.download()
+        a.parse()
+        return {
+            "title": a.title,
+            "text": clean_news_text(a.text)
+        }
+    except:
+        return None
+
+
+# ---------------- GENERIC SCRAPER ---------------- #
+def scrape_generic(url):
+    try:
+        page = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        soup = BeautifulSoup(page.text, "html.parser")
+
+        title = soup.find("h1").get_text(strip=True) if soup.find("h1") else "News Article"
+        all_p = soup.find_all("p")
+        text = " ".join(p.get_text(" ", strip=True) for p in all_p)
+        return {"title": title, "text": clean_news_text(text)}
+
+    except:
+        return {"title": "News Article", "text": ""}
+
+
+# ---------------- CLEANING NEWS TEXT ---------------- #
+def clean_news_text(text):
+    junk_patterns = [
+        r"(?i)read more",
+        r"(?i)also read",
+        r"(?i)toi entertainment desk",
+        r"(?i)recommended stories",
+        r"(?i)most searched",
+        r"(?i)trending",
+        r"(?i)click here",
+        r"(?i)follow us on",
+        r"(?i)10\s+[a-zA-Z]+",
+        r"(?i)we let chatgpt",
+    ]
+
+    for pattern in junk_patterns:
+        text = re.sub(pattern, "", text)
+
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        l = line.strip()
+        if len(l) < 20:
+            continue
+        if l.count(" ") < 3:
+            continue
+        cleaned.append(l)
+
+    cleaned_text = " ".join(cleaned)
+    cleaned_text = re.sub(r"\s+", " ", cleaned_text).strip()
+    return cleaned_text
+
+
+# -----------------------------------------------------------
+# NLP FUNCTIONS (TF–IDF SUMMARIZATION)
+# -----------------------------------------------------------
+
 def clean_text(article_body):
     sentences = []
     article = article_body.split(". ")
 
     for sentence in article:
-        # Keep English + all Indian languages
         sentence = re.sub(
             r"[^0-9A-Za-z\u0980-\u09FF\u0900-\u097F\u0C00-\u0C7F\u0B80-\u0BFF\u0A80-\u0AFF\u0D00-\u0D7F\s]",
-            " ",
-            sentence
+            " ", sentence
         )
         sentence = re.sub("\s+", " ", sentence).strip()
         if sentence:
@@ -82,7 +146,6 @@ def clean_text(article_body):
     return sentences
 
 
-# ---------------- WORD COUNTS ---------------- #
 def cnt_words(sent):
     return len(word_tokenize(sent))
 
@@ -91,7 +154,6 @@ def cnt_in_sent(sentences):
     return [{"id": i + 1, "word_cnt": cnt_words(sent)} for i, sent in enumerate(sentences)]
 
 
-# ---------------- FREQUENCY DICTIONARY ---------------- #
 def freq_dict(sentences):
     data = []
     for i, sent in enumerate(sentences):
@@ -102,7 +164,6 @@ def freq_dict(sentences):
     return data
 
 
-# ---------------- TF, IDF, TF-IDF ---------------- #
 def calc_TF(text_data, freq_list):
     tf = []
     for item in freq_list:
@@ -144,7 +205,6 @@ def calc_TFIDF(tf_scores, idf_scores):
     return result
 
 
-# ---------------- SENTENCE SCORING ---------------- #
 def sent_scores(tfidf_scores, sentences, text_data):
     data = []
     for item in text_data:
@@ -157,7 +217,6 @@ def sent_scores(tfidf_scores, sentences, text_data):
     return data
 
 
-# ---------------- SUMMARY ---------------- #
 def summary(sent_data, length):
     sent_data = sorted(sent_data, key=lambda x: x["score"], reverse=True)
 
@@ -168,32 +227,13 @@ def summary(sent_data, length):
     else:
         selected = sent_data[:7]
 
-    # Keep original order
     ordered = sorted(selected, key=lambda x: x["id"])
     return ". ".join([s["sentence"] for s in ordered]) + "."
 
 
-# ---------------- PDF (UNICODE SAFE) ---------------- #
-def summary_to_pdf(text, title="Summary"):
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-
-    # Load Unicode font (your uploaded file)
-    pdf.add_font("DejaVu", "", "DejaVuSans.ttf")
-    pdf.set_font("DejaVu", "", 16)
-    pdf.multi_cell(0, 10, title)
-    pdf.ln(5)
-
-    pdf.set_font("DejaVu", "", 12)
-    pdf.multi_cell(0, 8, text)
-
-    # fpdf2 returns bytearray → convert to bytes for Streamlit
-    pdf_bytes = pdf.output(dest="S")
-    return bytes(pdf_bytes)
-
-
-# ---------------- AUDIO ---------------- #
+# -----------------------------------------------------------
+# AUDIO GENERATION
+# -----------------------------------------------------------
 def summary_to_tts(text, lang_code="en"):
     try:
         tts = gTTS(text=text, lang=lang_code)
@@ -205,79 +245,68 @@ def summary_to_tts(text, lang_code="en"):
         return None
 
 
-# ---------------- MAIN UI ---------------- #
-def main():
-    st.sidebar.title("News Summarizer 📰")
-    page = st.sidebar.radio("Choose Option", ["Full Text", "Summary"])
+# -----------------------------------------------------------
+# STREAMLIT APP UI
+# -----------------------------------------------------------
+st.set_page_config(page_title="News Summarizer", page_icon="📰", layout="centered")
 
-    if page == "Full Text":
-        st.title("Full Article Extractor")
-        url = st.text_input("Enter article URL:")
-        if st.button("Get Text"):
-            text = get_article_body(url)
-            st.write(text)
+st.sidebar.title("News Summarizer 📰")
+page = st.sidebar.radio("Choose Option", ["Full Text", "Summary"])
 
-    else:
-        st.title("News Summarizer & Translator")
+if page == "Full Text":
+    st.title("Full Article Extractor")
+    url = st.text_input("Enter article URL:")
 
-        url = st.text_input("Enter article URL:")
-        languages = {
-            "English": "en",
-            "Hindi": "hi",
-            "Marathi": "mr",
-            "Tamil": "ta",
-            "Telugu": "te"
-        }
+    if st.button("Extract"):
+        article = get_article(url)
+        st.subheader(article["title"])
+        st.write(article["text"])
 
-        lang = st.selectbox("Translate summary into:", list(languages.keys()))
-        length = st.radio("Summary Length:", ["Low", "Medium", "High"])
-        auto = st.checkbox("Auto-detect article language", value=True)
+else:
+    st.title("News Summarizer + Translation + Audio")
 
-        if st.button("Summarize"):
-            article_body = get_article_body(url)
+    url = st.text_input("Enter Article URL:")
 
-            if auto:
-                try:
-                    detected = detect(article_body)
-                    st.info(f"Detected Language (ISO): {detected}")
-                except:
-                    st.info("Language detection failed.")
+    languages = {
+        "English": "en",
+        "Hindi": "hi",
+        "Marathi": "mr",
+        "Tamil": "ta",
+        "Telugu": "te",
+        "Bengali": "bn"
+    }
 
-            sentences = clean_text(article_body)
-            text_data = cnt_in_sent(sentences)
-            freq_list = freq_dict(sentences)
-            tf_scores = calc_TF(text_data, freq_list)
-            idf_scores = calc_IDF(text_data, freq_list)
-            tfidf_scores = calc_TFIDF(tf_scores, idf_scores)
-            sent_data = sent_scores(tfidf_scores, sentences, text_data)
+    lang = st.selectbox("Translate summary into:", list(languages.keys()))
+    length = st.radio("Summary Length:", ["Low", "Medium", "High"])
+    auto = st.checkbox("Auto-detect language", value=True)
 
-            result = summary(sent_data, length)
+    if st.button("Summarize"):
 
-            translated = GoogleTranslator(source='auto', target=languages[lang]).translate(result)
+        article = get_article(url)
+        article_text = article["text"]
 
-            st.subheader(f"Summary in {lang}")
-            st.write(translated)
+        if auto:
+            try:
+                detected = detect(article_text)
+                st.info(f"Detected Language: {detected}")
+            except:
+                st.warning("Language detection failed.")
 
-            # PDF download
-            pdf_bytes = summary_to_pdf(translated)
-            st.download_button(
-                "Download PDF", 
-                pdf_bytes, 
-                "summary.pdf", 
-                "application/pdf"
-            )
+        sentences = clean_text(article_text)
+        text_data = cnt_in_sent(sentences)
+        freq_list = freq_dict(sentences)
+        tf_scores = calc_TF(text_data, freq_list)
+        idf_scores = calc_IDF(text_data, freq_list)
+        tfidf_scores = calc_TFIDF(tf_scores, idf_scores)
+        sent_data = sent_scores(tfidf_scores, sentences, text_data)
 
-            # Audio download
-            audio_buf = summary_to_tts(translated, languages[lang])
-            if audio_buf:
-                st.audio(audio_buf, format="audio/mp3")
-                st.download_button(
-                    "Download MP3", 
-                    audio_buf, 
-                    "summary.mp3", 
-                    "audio/mpeg"
-                )
+        result = summary(sent_data, length)
+        translated = GoogleTranslator(source="auto", target=languages[lang]).translate(result)
 
+        st.subheader(f"Summary in {lang}")
+        st.write(translated)
 
-if __name__ == "__main__":
-    main()
+        audio_buf = summary_to_tts(translated, languages[lang])
+        if audio_buf:
+            st.audio(audio_buf, format="audio/mp3")
+            st.download_button("Download MP3", audio_buf, "summary.mp3", "audio/mpeg")
